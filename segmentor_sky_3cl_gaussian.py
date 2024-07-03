@@ -5,31 +5,33 @@ import torch.nn.functional as F
 import numpy as np
 from prep_image import extract_features
 from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 import cv2
 import matplotlib.pyplot as plt
+import os
 
 
-def cluster_sky_non_sky(features, image, n_clusters=2, sample_points=None, sample_labels=None):
+def cluster_sky_non_sky(features, image, n_clusters=3, sample_points=None, sample_labels=None):
     # Flatten the feature tensor
     height, width, num_features = features.shape
     features_flattened = features.reshape(-1, num_features)
 
-    # If sample points and labels are provided, use them to initialize KMeans
+    # If sample points and labels are provided, use them to initialize GMM
     if sample_points is not None and sample_labels is not None:
         # Convert sample points to indices
         sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
         # Initialize cluster centers with the provided samples
-        init_centers = np.array([features_flattened[sample_indices[sample_labels == label]].mean(axis=0)
-                                 for label in np.unique(sample_labels)])
-        kmeans = KMeans(n_clusters=n_clusters, init=init_centers, n_init=1)
+        init_means = np.array([features_flattened[sample_indices[sample_labels == label]].mean(axis=0)
+                               for label in np.unique(sample_labels)])
+        gmm = GaussianMixture(n_components=n_clusters, means_init=init_means)
     else:
-        kmeans = KMeans(n_clusters=n_clusters)
+        gmm = GaussianMixture(n_components=n_clusters)
 
-    # Fit KMeans to the flattened features
-    kmeans.fit(features_flattened)
+    # Fit GMM to the flattened features
+    gmm.fit(features_flattened)
 
     # Get the cluster labels for each pixel
-    labels = kmeans.labels_
+    labels = gmm.predict(features_flattened)
 
     # Reshape the labels back to the image shape
     labels_image = labels.reshape(height, width)
@@ -148,29 +150,30 @@ def get_random_unmasked_points(mask, num_points=1000):
     return selected_points
 
 
-def concatenate_points_and_labels(sky_points, non_sky_points):
+def concatenate_points_and_labels(*arrays_with_labels):
     """
-    Concatenate sky and non-sky points and generate corresponding labels.
+    Concatenate multiple arrays of points with corresponding labels.
 
     Parameters:
-    sky_points (np.ndarray): Array of sky points with shape (n_sky, 2).
-    non_sky_points (np.ndarray): Array of non-sky points with shape (n_non_sky, 2).
+    *arrays_with_labels (tuple): Tuples where each tuple contains an array of points and the corresponding label.
 
     Returns:
     combined_points (list): List of combined points as tuples.
-    combined_labels (np.ndarray): Array of combined labels with 1 for sky and 0 for non-sky points.
+    combined_labels (np.ndarray): Array of combined labels for the points.
     """
-    # Convert sky points and non-sky points to lists of tuples
-    sky_points_list = [tuple(row) for row in sky_points]
-    non_sky_points_list = [tuple(row) for row in non_sky_points]
+    combined_points = []
+    combined_labels = []
 
-    # Concatenate the points lists
-    combined_points = sky_points_list + non_sky_points_list
+    for points, label in arrays_with_labels:
+        # Convert points to a list of tuples
+        points_list = [tuple(row) for row in points]
+        combined_points.extend(points_list)
 
-    # Create labels
-    sky_labels = np.ones(len(sky_points), dtype=int)
-    non_sky_labels = np.zeros(len(non_sky_points), dtype=int)
-    combined_labels = np.concatenate((sky_labels, non_sky_labels))
+        # Create labels for these points
+        labels = np.full(len(points), label, dtype=int)
+        combined_labels.extend(labels)
+
+    combined_labels = np.array(combined_labels)
 
     return combined_points, combined_labels
 
@@ -253,35 +256,62 @@ def sobel_filters(img):
     return (G, theta)
 
 
+# Save the clustered image with a new name
+def save_image_with_suffix(image_path, image):
+    base, ext = os.path.splitext(image_path)
+    new_image_path = f"{base}_after_gaussian-{ext}"
+    cv2.imwrite(new_image_path, image)
+    print(f"Image saved as: {new_image_path}")
+
+
 # Define the paths to your models
 processor_name = "nvidia/segformer-b5-finetuned-ade-640-640"
 # Instantiate the SegmentationProcessor
 seg_processor = SegmentationProcessor_sky()
 
 # Process an image and get the masks
-image_path = "/home/kasra/PycharmProjects/segformer-train/src/segformer_trainer/assets/4.jpg"
-# Load the image
-image = cv2.imread(image_path)
-image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-feature_image = extract_features(image_rgb)
-image = Image.open(image_path)
-mask, masks, box, labels_mask, model = seg_processor.process_image(image)
-sky_pixels = get_random_unmasked_points(mask=mask, num_points=10000)
-non_sky_pixels = get_random_unmasked_points(mask=~mask, num_points=10000)
-init_points, init_labels = concatenate_points_and_labels(sky_points=sky_pixels, non_sky_points=non_sky_pixels)# labels_mask[pixels[1,:][1], pixels[1,:][2]
-# Cluster the pixels
-labels_image = 255.0 * cluster_sky_non_sky(feature_image, image_rgb, sample_points=init_points, sample_labels=init_labels)
-integrated_mask = merge_masks(masks, exclude_keys=['sky', 'tree'])
-# final_mask = labels_image[integrated_mask > 0]
-final_mask = np.zeros_like(labels_image, dtype=np.uint8)
-final_mask[integrated_mask > 0] = labels_image[integrated_mask > 0]
+for i in range(1, 20):
 
-grad, angle1 = sobel_filters(final_mask)
-final_mask = non_max_suppression(final_mask, angle1)
+    try:
+
+        image_path = f"/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/{i}.jpg"
+        # Load the image
+        image = cv2.imread(image_path)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        feature_image = extract_features(image_rgb)
+        image = Image.open(image_path)
+        mask, masks, box, labels_mask, model = seg_processor.process_image(image)
+        mask_tree = masks["tree"] > 0
+        non_sky_tree_mask = ~np.logical_or(mask_tree, mask)
+        sky_pixels = get_random_unmasked_points(mask=mask, num_points=10000)
+        tree_pixels = get_random_unmasked_points(mask=mask_tree, num_points=10000)
+        non_sky_pixels = get_random_unmasked_points(mask=non_sky_tree_mask, num_points=10000)
+
+        init_points, init_labels = concatenate_points_and_labels(
+                                            (non_sky_pixels, 0),
+                                                           (sky_pixels, 1),
+                                                           (tree_pixels, 2)
+                                                            )# labels_mask[pixels[1,:][1], pixels[1,:][2]
+        # Cluster the pixels
+        labels_image = cluster_sky_non_sky(feature_image, image_rgb, sample_points=init_points,
+                                                   sample_labels=init_labels)
+
+        labels_image = labels_image == 1
+        integrated_mask = merge_masks(masks, exclude_keys=['sky', 'tree'])
+        # final_mask = labels_image[integrated_mask > 0]
+        final_mask = np.zeros_like(labels_image, dtype=np.uint8)
+        final_mask[integrated_mask > 0] = labels_image[integrated_mask > 0]
+        final_mask = 255.0 * final_mask
+        # grad, angle1 = sobel_filters(final_mask)
+        # final_mask = non_max_suppression(final_mask, angle1)
+        save_image_with_suffix(image_path, final_mask.astype(np.uint8))
+
+    except:
+        print("An exception occurred")
 
 # Visualize the clustered image
-plt.figure(figsize=(10, 10))
-plt.imshow(final_mask, cmap='gray')
-plt.title('Sky and Non-Sky Clusters')
-plt.show()
+# plt.figure(figsize=(20, 20))
+# plt.imshow(final_mask, cmap='gray')
+# plt.title('Sky and Non-Sky Clusters')
+# plt.show()
 

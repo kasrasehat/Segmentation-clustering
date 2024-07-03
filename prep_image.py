@@ -145,13 +145,20 @@ def extract_features(image_rgb, kernel_size=5, lbp_radius=1, lbp_points=8, hog_o
     image_with_dwt = np.concatenate(
         (image_with_std_color_all, LL_normalized, LH_normalized, HL_normalized, HH_normalized), axis=2)
 
+    # Compute the Canny edge detection
+    edges = cv2.Canny(image_gray, threshold1=120, threshold2=160)
+
+    # Append the edges channel to the original image
+    edges = edges[:, :, np.newaxis]  # Add a new axis to match the image dimensions
+    image_with_edges = np.concatenate((image_with_dwt, edges), axis=2)
+
     # Normalize each channel separately
-    for i in range(image_with_dwt.shape[2]):
-        channel = image_with_dwt[:, :, i]
+    for i in range(image_with_edges.shape[2]):
+        channel = image_with_edges[:, :, i]
         min_val = np.min(channel)
         max_val = np.max(channel)
-        image_with_dwt[:, :, i] = (channel - min_val) / (max_val - min_val)
+        image_with_edges[:, :, i] = (channel - min_val) / (max_val - min_val)
 
-    return image_with_dwt
+    return image_with_edges
 
 
