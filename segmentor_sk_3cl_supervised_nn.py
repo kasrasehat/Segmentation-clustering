@@ -9,33 +9,67 @@ from sklearn.mixture import GaussianMixture
 import cv2
 import matplotlib.pyplot as plt
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 
 
-def cluster_sky_non_sky(features, image, n_clusters=3, sample_points=None, sample_labels=None):
-    # Flatten the feature tensor
+def prepare_data(features, sample_points, sample_labels, device):
     height, width, num_features = features.shape
     features_flattened = features.reshape(-1, num_features)
+    sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
+    X_train = torch.tensor(features_flattened[sample_indices]).float().to(device)
+    y_train = torch.tensor(sample_labels).long().to(device)  # One-hot encoding for 3 classes
+    return features_flattened, X_train, y_train, height, width
 
-    # If sample points and labels are provided, use them to initialize KMeans
-    if sample_points is not None and sample_labels is not None:
-        # Convert sample points to indices
-        sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
-        # Initialize cluster centers with the provided samples
-        init_centers = np.array([features_flattened[sample_indices[sample_labels == label]].mean(axis=0)
-                                 for label in np.unique(sample_labels)])
-        kmeans = KMeans(n_clusters=n_clusters, init=init_centers, n_init=1)
-    else:
-        kmeans = KMeans(n_clusters=n_clusters)
 
-    # Fit KMeans to the flattened features
-    kmeans.fit(features_flattened)
+class SimpleNN(nn.Module):
+    def __init__(self, input_size):
+        super(SimpleNN, self).__init__()
+        self.fc1 = nn.Linear(input_size, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 3)  # 3 output classes
 
-    # Get the cluster labels for each pixel
-    labels = kmeans.labels_
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)  # No softmax here, softmax will be handled by nn.CrossEntropyLoss
+        return x
 
-    # Reshape the labels back to the image shape
-    labels_image = labels.reshape(height, width)
 
+def train_and_predict_nn(features_flattened, X_train, y_train, height, width, device):
+    model = SimpleNN(features_flattened.shape[1]).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.33)  # Reduce LR every 10 epochs
+
+    dataset = TensorDataset(X_train, y_train)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
+
+    model.train()
+    for epoch in range(50):  # Train for more epochs
+        for inputs, labels in dataloader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()  # Adjust the learning rate
+        print(f'Epoch {epoch+1}, Loss: {loss.item()}, LR: {scheduler.get_last_lr()}')
+
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(torch.tensor(features_flattened).float().to(device))
+    _, y_pred_labels = torch.max(y_pred, 1)
+    labels_image = y_pred_labels.cpu().numpy().reshape(height, width)
+
+    return labels_image
+
+
+def cluster_sky_non_sky_nn(features, sample_points, sample_labels, device):
+    features_flattened, X_train, y_train, height, width = prepare_data(features, sample_points, sample_labels, device)
+    labels_image = train_and_predict_nn(features_flattened, X_train, y_train, height, width, device)
     return labels_image
 
 
@@ -264,13 +298,17 @@ def save_image_with_suffix(image_path, image):
     print(f"Image saved as: {new_image_path}")
 
 
+# Check if CUDA (GPU) is available and set device
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {device}')
+
 # Define the paths to your models
 processor_name = "nvidia/segformer-b5-finetuned-ade-640-640"
 # Instantiate the SegmentationProcessor
 seg_processor = SegmentationProcessor_sky()
 
 # Process an image and get the masks
-image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/13.jpg"
+image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/8.jpg"
 # Load the image
 image = cv2.imread(image_path)
 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -279,9 +317,9 @@ image = Image.open(image_path)
 mask, masks, box, labels_mask, model = seg_processor.process_image(image)
 mask_tree = masks["tree"] > 0
 non_sky_tree_mask = ~np.logical_or(mask_tree, mask)
-sky_pixels = get_random_unmasked_points(mask=mask, num_points=10000)
-tree_pixels = get_random_unmasked_points(mask=mask_tree, num_points=10000)
-non_sky_pixels = get_random_unmasked_points(mask=non_sky_tree_mask, num_points=10000)
+sky_pixels = get_random_unmasked_points(mask=mask, num_points=20000)
+tree_pixels = get_random_unmasked_points(mask=mask_tree, num_points=20000)
+non_sky_pixels = get_random_unmasked_points(mask=non_sky_tree_mask, num_points=20000)
 
 init_points, init_labels = concatenate_points_and_labels(
                                     (non_sky_pixels, 0),
@@ -289,20 +327,18 @@ init_points, init_labels = concatenate_points_and_labels(
                                                    (tree_pixels, 2)
                                                     )# labels_mask[pixels[1,:][1], pixels[1,:][2]
 # Cluster the pixels
-labels_image = cluster_sky_non_sky(feature_image, image_rgb, sample_points=init_points,
-                                           sample_labels=init_labels)
-
+labels_image = cluster_sky_non_sky_nn(feature_image, sample_points=init_points,
+                                      sample_labels=init_labels, device=device)
 labels_image = labels_image == 1
 integrated_mask = merge_masks(masks, exclude_keys=['sky', 'tree'])
 # final_mask = labels_image[integrated_mask > 0]
 final_mask = np.zeros_like(labels_image, dtype=np.uint8)
 final_mask[integrated_mask > 0] = labels_image[integrated_mask > 0]
-# final_mask[masks["sky"] > 0] = 1
 final_mask = 255.0 * final_mask
 # grad, angle1 = sobel_filters(final_mask)
 # final_mask = 255 * non_max_suppression(final_mask, angle1)
 
-save_image_with_suffix(image_path, final_mask.astype(np.uint8))
+# save_image_with_suffix(image_path, final_mask.astype(np.uint8))
 # Visualize the clustered image
 plt.figure(figsize=(20, 20))
 plt.imshow(final_mask, cmap='gray')

@@ -9,34 +9,41 @@ from sklearn.mixture import GaussianMixture
 import cv2
 import matplotlib.pyplot as plt
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+import xgboost as xgb
+import torch
 
 
-def cluster_sky_non_sky(features, image, n_clusters=3, sample_points=None, sample_labels=None):
-    # Flatten the feature tensor
+def prepare_data(features, sample_points, sample_labels):
     height, width, num_features = features.shape
     features_flattened = features.reshape(-1, num_features)
+    sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
+    X_train = features_flattened[sample_indices]
+    y_train = sample_labels
+    return features_flattened, X_train, y_train, height, width
 
-    # If sample points and labels are provided, use them to initialize KMeans
-    if sample_points is not None and sample_labels is not None:
-        # Convert sample points to indices
-        sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
-        # Initialize cluster centers with the provided samples
-        init_centers = np.array([features_flattened[sample_indices[sample_labels == label]].mean(axis=0)
-                                 for label in np.unique(sample_labels)])
-        kmeans = KMeans(n_clusters=n_clusters, init=init_centers, n_init=1)
-    else:
-        kmeans = KMeans(n_clusters=n_clusters)
 
-    # Fit KMeans to the flattened features
-    kmeans.fit(features_flattened)
+def train_and_predict_xgb(features_flattened, X_train, y_train, height, width):
+    model = xgb.XGBClassifier(n_estimators=70, use_label_encoder=False, eval_metric='mlogloss')
+    model.fit(X_train, y_train)
 
-    # Get the cluster labels for each pixel
-    labels = kmeans.labels_
+    y_pred = model.predict(features_flattened)
+    labels_image = y_pred.reshape(height, width)
+    # Get feature importances
+    feature_importances = model.feature_importances_
+    feature_importance_order = np.argsort(feature_importances)[::-1]
 
-    # Reshape the labels back to the image shape
-    labels_image = labels.reshape(height, width)
+    return labels_image, feature_importance_order
 
-    return labels_image
+
+def cluster_sky_non_sky_xgb(features, sample_points, sample_labels):
+    features_flattened, X_train, y_train, height, width = prepare_data(features, sample_points, sample_labels)
+    labels_image, feature_importance_order = train_and_predict_xgb(features_flattened, X_train, y_train, height, width)
+    return labels_image, feature_importance_order
 
 
 class SegmentationProcessor_sky:
@@ -264,13 +271,17 @@ def save_image_with_suffix(image_path, image):
     print(f"Image saved as: {new_image_path}")
 
 
+# Check if CUDA (GPU) is available and set device
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {device}')
+
 # Define the paths to your models
 processor_name = "nvidia/segformer-b5-finetuned-ade-640-640"
 # Instantiate the SegmentationProcessor
 seg_processor = SegmentationProcessor_sky()
 
 # Process an image and get the masks
-image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/13.jpg"
+image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/8.jpg"
 # Load the image
 image = cv2.imread(image_path)
 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -279,9 +290,9 @@ image = Image.open(image_path)
 mask, masks, box, labels_mask, model = seg_processor.process_image(image)
 mask_tree = masks["tree"] > 0
 non_sky_tree_mask = ~np.logical_or(mask_tree, mask)
-sky_pixels = get_random_unmasked_points(mask=mask, num_points=10000)
-tree_pixels = get_random_unmasked_points(mask=mask_tree, num_points=10000)
-non_sky_pixels = get_random_unmasked_points(mask=non_sky_tree_mask, num_points=10000)
+sky_pixels = get_random_unmasked_points(mask=mask, num_points=20000)
+tree_pixels = get_random_unmasked_points(mask=mask_tree, num_points=20000)
+non_sky_pixels = get_random_unmasked_points(mask=non_sky_tree_mask, num_points=20000)
 
 init_points, init_labels = concatenate_points_and_labels(
                                     (non_sky_pixels, 0),
@@ -289,20 +300,17 @@ init_points, init_labels = concatenate_points_and_labels(
                                                    (tree_pixels, 2)
                                                     )# labels_mask[pixels[1,:][1], pixels[1,:][2]
 # Cluster the pixels
-labels_image = cluster_sky_non_sky(feature_image, image_rgb, sample_points=init_points,
-                                           sample_labels=init_labels)
-
+labels_image, feature_importances = cluster_sky_non_sky_xgb(feature_image, sample_points=init_points, sample_labels=init_labels)
 labels_image = labels_image == 1
 integrated_mask = merge_masks(masks, exclude_keys=['sky', 'tree'])
 # final_mask = labels_image[integrated_mask > 0]
 final_mask = np.zeros_like(labels_image, dtype=np.uint8)
 final_mask[integrated_mask > 0] = labels_image[integrated_mask > 0]
-# final_mask[masks["sky"] > 0] = 1
 final_mask = 255.0 * final_mask
 # grad, angle1 = sobel_filters(final_mask)
 # final_mask = 255 * non_max_suppression(final_mask, angle1)
-
-save_image_with_suffix(image_path, final_mask.astype(np.uint8))
+print(feature_importances)
+# save_image_with_suffix(image_path, final_mask.astype(np.uint8))
 # Visualize the clustered image
 plt.figure(figsize=(20, 20))
 plt.imshow(final_mask, cmap='gray')

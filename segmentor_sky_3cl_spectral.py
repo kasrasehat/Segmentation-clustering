@@ -4,11 +4,49 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from prep_image import extract_features
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, SpectralClustering, MeanShift, estimate_bandwidth, DBSCAN
 from sklearn.mixture import GaussianMixture
 import cv2
 import matplotlib.pyplot as plt
 import os
+
+
+def cluster_sky_non_sky_dbscan(features, sample_points=None, sample_labels=None, eps=0.5, min_samples=5):
+    """
+    Cluster pixels into sky and non-sky using DBSCAN clustering.
+
+    Parameters:
+    features (np.ndarray): Feature tensor with shape (height, width, num_features).
+    sample_points (list of tuples): List of (row, col) tuples for sample points.
+    sample_labels (np.ndarray): Corresponding labels for the sample points (1 for sky, 0 for non-sky).
+    eps (float): The maximum distance between two samples for one to be considered as in the neighborhood of the other.
+    min_samples (int): The number of samples in a neighborhood for a point to be considered as a core point.
+
+    Returns:
+    labels_image (np.ndarray): Cluster labels for each pixel with shape (height, width).
+    """
+    # Flatten the feature tensor
+    height, width, num_features = features.shape
+    features_flattened = features.reshape(-1, num_features)
+
+    # If sample points and labels are provided, use them to guide the clustering
+    if sample_points is not None and sample_labels is not None:
+        # Convert sample points to indices
+        sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
+        # Assign core sample indices based on the provided samples
+        core_samples = np.zeros(features_flattened.shape[0], dtype=bool)
+        core_samples[sample_indices] = True
+
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+        labels = dbscan.fit_predict(features_flattened, sample_weight=core_samples.astype(int))
+    else:
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+        labels = dbscan.fit_predict(features_flattened)
+
+    # Reshape the labels back to the image shape
+    labels_image = labels.reshape(height, width)
+
+    return labels_image
 
 
 def cluster_sky_non_sky(features, image, n_clusters=3, sample_points=None, sample_labels=None):
@@ -32,6 +70,83 @@ def cluster_sky_non_sky(features, image, n_clusters=3, sample_points=None, sampl
 
     # Get the cluster labels for each pixel
     labels = kmeans.labels_
+
+    # Reshape the labels back to the image shape
+    labels_image = labels.reshape(height, width)
+
+    return labels_image
+
+
+
+def cluster_sky_non_sky_mean_shift(features, sample_points=None, sample_labels=None, bandwidth=None):
+    """
+    Cluster pixels into sky and non-sky using Mean Shift clustering.
+
+    Parameters:
+    features (np.ndarray): Feature tensor with shape (height, width, num_features).
+    sample_points (list of tuples): List of (row, col) tuples for sample points.
+    sample_labels (np.ndarray): Corresponding labels for the sample points (1 for sky, 0 for non-sky).
+
+    Returns:
+    labels_image (np.ndarray): Cluster labels for each pixel with shape (height, width).
+    """
+    # Flatten the feature tensor
+    height, width, num_features = features.shape
+    features_flattened = features.reshape(-1, num_features)
+
+    # Estimate the bandwidth if not provided
+    if bandwidth is None:
+        bandwidth = 3 * estimate_bandwidth(features_flattened, quantile=0.2, n_samples=500)
+
+    # If sample points and labels are provided, use them to initialize cluster centers
+    if sample_points is not None and sample_labels is not None:
+        # Convert sample points to indices
+        sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
+        # Initialize cluster centers with the provided samples
+        init_centers = np.array([features_flattened[sample_indices[sample_labels == label]].mean(axis=0)
+                                 for label in np.unique(sample_labels)])
+        mean_shift = MeanShift(bandwidth=bandwidth, seeds=init_centers)
+    else:
+        mean_shift = MeanShift(bandwidth=bandwidth)
+
+    # Fit Mean Shift to the flattened features
+    mean_shift.fit(features_flattened)
+
+    # Get the cluster labels for each pixel
+    labels = mean_shift.labels_
+
+    # Reshape the labels back to the image shape
+    labels_image = labels.reshape(height, width)
+
+    return labels_image
+
+def cluster_sky_non_sky_spectral(features, n_clusters=3, sample_points=None, sample_labels=None):
+    # Flatten the feature tensor
+    height, width, num_features = features.shape
+    features_flattened = features.reshape(-1, num_features)
+
+    # If sample points and labels are provided, use them to initialize cluster labels
+    if sample_points is not None and sample_labels is not None:
+        # Convert sample points to indices
+        sample_indices = np.array([point[0] * width + point[1] for point in sample_points])
+
+        # Create a placeholder for initial labels
+        initial_labels = -np.ones(features_flattened.shape[0], dtype=int)
+        initial_labels[sample_indices] = sample_labels
+
+        # Create a mask for known labels
+        known_mask = initial_labels != -1
+
+        # Use Spectral Clustering with nearest neighbors affinity
+        spectral = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors', assign_labels='kmeans')
+        # Fit the model using only the known labels
+        labels = spectral.fit_predict(features_flattened)
+
+        # Assign known labels back
+        labels[known_mask] = initial_labels[known_mask]
+    else:
+        spectral = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors', assign_labels='kmeans')
+        labels = spectral.fit_predict(features_flattened)
 
     # Reshape the labels back to the image shape
     labels_image = labels.reshape(height, width)
@@ -270,7 +385,7 @@ processor_name = "nvidia/segformer-b5-finetuned-ade-640-640"
 seg_processor = SegmentationProcessor_sky()
 
 # Process an image and get the masks
-image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/13.jpg"
+image_path = "/home/kasra/PycharmProjects/DataFiltering/d2d_post_processor/assets/8.jpg"
 # Load the image
 image = cv2.imread(image_path)
 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -289,20 +404,18 @@ init_points, init_labels = concatenate_points_and_labels(
                                                    (tree_pixels, 2)
                                                     )# labels_mask[pixels[1,:][1], pixels[1,:][2]
 # Cluster the pixels
-labels_image = cluster_sky_non_sky(feature_image, image_rgb, sample_points=init_points,
-                                           sample_labels=init_labels)
+labels_image = cluster_sky_non_sky_dbscan(feature_image, sample_points=init_points, sample_labels=init_labels)
 
 labels_image = labels_image == 1
 integrated_mask = merge_masks(masks, exclude_keys=['sky', 'tree'])
 # final_mask = labels_image[integrated_mask > 0]
 final_mask = np.zeros_like(labels_image, dtype=np.uint8)
 final_mask[integrated_mask > 0] = labels_image[integrated_mask > 0]
-# final_mask[masks["sky"] > 0] = 1
 final_mask = 255.0 * final_mask
 # grad, angle1 = sobel_filters(final_mask)
 # final_mask = 255 * non_max_suppression(final_mask, angle1)
 
-save_image_with_suffix(image_path, final_mask.astype(np.uint8))
+# save_image_with_suffix(image_path, final_mask.astype(np.uint8))
 # Visualize the clustered image
 plt.figure(figsize=(20, 20))
 plt.imshow(final_mask, cmap='gray')

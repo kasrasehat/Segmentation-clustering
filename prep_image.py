@@ -2,15 +2,20 @@ import cv2
 import numpy as np
 import pywt
 from skimage.feature import local_binary_pattern, hog
-
+import sys
+import importlib.util
+import sys
+from depth_map import on_submit
 
 def extract_features(image_rgb, kernel_size=5, lbp_radius=1, lbp_points=8, hog_orientations=8,
                      hog_pixels_per_cell=(16, 16), hog_cells_per_block=(1, 1), gabor_frequencies=[0.1, 0.2, 0.3],
                      gabor_orientations=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]):
 
+    depth_map = on_submit(image_rgb)
+    image_with_depth = np.concatenate((image_rgb, depth_map), axis=2)
     # Convert the image to HSV color space
     image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
-    image_with_hsv = np.concatenate((image_rgb, image_hsv), axis=2)
+    image_with_hsv = np.concatenate((image_with_depth, image_hsv), axis=2)
 
     # Convert the image to LAB color space
     image_lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
